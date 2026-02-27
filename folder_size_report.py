@@ -13,7 +13,8 @@ from __future__ import annotations
 import argparse
 import heapq
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -28,18 +29,55 @@ def human_size(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
-def walk_and_collect(root: str) -> Tuple[Dict[str, int], Dict[str, List[str]], int]:
+def walk_and_collect(root: str, workers: int = 1) -> Tuple[Dict[str, int], Dict[str, List[str]], int]:
     own_size: Dict[str, int] = defaultdict(int)
     children: Dict[str, List[str]] = defaultdict(list)
     visited_dirs = 0
 
-    stack = [os.path.abspath(root)]
-    dirs_visited = []
+    root_abs = os.path.abspath(root)
 
-    while stack:
-        current_dir = stack.pop()
-        visited_dirs += 1
-        dirs_visited.append(current_dir)
+    # Single-threaded fast path (current behavior).
+    if workers <= 1:
+        stack = [root_abs]
+        dirs_visited_order: List[str] = []
+
+        while stack:
+            current_dir = stack.pop()
+            visited_dirs += 1
+            dirs_visited_order.append(current_dir)
+
+            try:
+                with os.scandir(current_dir) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir():
+                                child_path = entry.path
+                                children[current_dir].append(child_path)
+                                stack.append(child_path)
+                            elif entry.is_file():
+                                own_size[current_dir] += entry.stat(follow_symlinks=False).st_size
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError):
+                continue
+
+        total_size: Dict[str, int] = dict(own_size)
+
+        # Post-order aggregation: reversed stack order ensures children are processed before parents.
+        for d in reversed(dirs_visited_order):
+            if d not in total_size:
+                total_size[d] = 0
+            for child in children.get(d, []):
+                total_size[d] += total_size.get(child, 0)
+
+        return total_size, children, visited_dirs
+
+    # Multi-threaded directory scanning using a thread pool.
+    def scan_dir(current_dir: str) -> Tuple[str, int, List[str]]:
+        size = 0
+        subdirs: List[str] = []
 
         try:
             with os.scandir(current_dir) as it:
@@ -48,20 +86,46 @@ def walk_and_collect(root: str) -> Tuple[Dict[str, int], Dict[str, List[str]], i
                         if entry.is_symlink():
                             continue
                         if entry.is_dir():
-                            child_path = entry.path
-                            children[current_dir].append(child_path)
-                            stack.append(child_path)
+                            subdirs.append(entry.path)
                         elif entry.is_file():
-                            own_size[current_dir] += entry.stat(follow_symlinks=False).st_size
+                            size += entry.stat(follow_symlinks=False).st_size
                     except (OSError, PermissionError):
                         continue
         except (OSError, PermissionError):
-            continue
+            return current_dir, 0, []
 
-    total_size: Dict[str, int] = dict(own_size)
+        return current_dir, size, subdirs
 
-    # Post-order aggregation: reversed stack order ensures children are processed before parents.
-    for d in reversed(dirs_visited):
+    queue = deque([root_abs])
+    dirs_visited_order: List[str] = []
+
+    with ThreadPoolExecutor(max_workers=max(2, workers)) as executor:
+        pending = set()
+
+        while queue or pending:
+            while queue and len(pending) < workers:
+                d = queue.popleft()
+                future = executor.submit(scan_dir, d)
+                pending.add(future)
+
+            if not pending:
+                break
+
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+
+            for fut in done:
+                current_dir, size, subdirs = fut.result()
+                dirs_visited_order.append(current_dir)
+                visited_dirs += 1
+                own_size[current_dir] += size
+                if subdirs:
+                    children[current_dir].extend(subdirs)
+                    for child in subdirs:
+                        queue.append(child)
+
+    total_size = dict(own_size)
+
+    for d in reversed(dirs_visited_order):
         if d not in total_size:
             total_size[d] = 0
         for child in children.get(d, []):
