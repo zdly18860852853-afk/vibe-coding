@@ -29,42 +29,43 @@ def human_size(num_bytes: int) -> str:
 
 
 def walk_and_collect(root: str) -> Tuple[Dict[str, int], Dict[str, List[str]], int]:
-    # own_size stores only direct file sizes in each directory.
     own_size: Dict[str, int] = defaultdict(int)
     children: Dict[str, List[str]] = defaultdict(list)
     visited_dirs = 0
 
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+    stack = [os.path.abspath(root)]
+    dirs_visited = []
+
+    while stack:
+        current_dir = stack.pop()
         visited_dirs += 1
-        abs_dir = os.path.abspath(dirpath)
+        dirs_visited.append(current_dir)
 
-        # Keep parent-child mapping for tree output.
-        for name in dirnames:
-            child = os.path.join(abs_dir, name)
-            children[abs_dir].append(child)
+        try:
+            with os.scandir(current_dir) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir():
+                            child_path = entry.path
+                            children[current_dir].append(child_path)
+                            stack.append(child_path)
+                        elif entry.is_file():
+                            own_size[current_dir] += entry.stat(follow_symlinks=False).st_size
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            continue
 
-        # Sum direct file sizes inside current directory.
-        for filename in filenames:
-            file_path = os.path.join(abs_dir, filename)
-            try:
-                own_size[abs_dir] += os.path.getsize(file_path)
-            except (OSError, PermissionError):
-                # Skip files we cannot access.
-                continue
-
-    # total_size stores recursive directory sizes.
     total_size: Dict[str, int] = dict(own_size)
 
-    # Post-order aggregation: larger depth first.
-    all_dirs = set(total_size) | set(children)
-    for directory in sorted(all_dirs, key=lambda p: p.count(os.sep), reverse=True):
-        parent = os.path.dirname(directory.rstrip("\\/"))
-        if parent and directory != parent:
-            total_size[parent] = total_size.get(parent, 0) + total_size.get(directory, 0)
-
-    # Ensure all discovered directories exist in total_size.
-    for d in all_dirs:
-        total_size.setdefault(d, 0)
+    # Post-order aggregation: reversed stack order ensures children are processed before parents.
+    for d in reversed(dirs_visited):
+        if d not in total_size:
+            total_size[d] = 0
+        for child in children.get(d, []):
+            total_size[d] += total_size.get(child, 0)
 
     return total_size, children, visited_dirs
 
